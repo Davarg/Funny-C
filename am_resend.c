@@ -26,9 +26,9 @@ void showTips(char *name);
 void initGlobals(char *argv[]);
 const uint8_t* getMac(u_char *macStr);
 
-void decodeIP(const u_char *packet);
 u_int decodeTCP(const u_char *packet);
-void decodeEther(const u_char *packet);
+struct amIPHdr* decodeIP(const u_char *packet);
+struct amEtherHdr* decodeEther(const u_char *packet);
 
 void dump(const u_char *dataBuffer, const u_int length);
 void gotPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *packet);
@@ -37,11 +37,15 @@ void gotPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pac
 * GLOBALS
 * [SOMEONE(source)] <-> [ME(target)] <-> [DESTINATION(router)]
 */
-u_char sourceIPAddr[kMaxIPLen];
+libnet_t *lContext;
+
 u_char sourceMac[kMaxMacLen];
-u_char destinationIPAddr[kMaxIPLen];
-u_char destinationMac[kMaxMacLen];
+u_char sourceIPAddr[kMaxIPLen];
+
 u_char interface[kMaxInterfaceLen];
+
+u_char destinationMac[kMaxMacLen];
+u_char destinationIPAddr[kMaxIPLen];
 
 int main(int argc, char *argv[]) {
 	if (argc < kNeededArgsQty) {
@@ -58,14 +62,14 @@ int main(int argc, char *argv[]) {
   /**
   * Open in non-promiscuous mode
   */
-  pcapHandle = pcap_open_live(interface, 128, 0, 0, errBuf);
+  pcapHandle = pcap_open_live(interface, 4096, 0, 0, errBuf);
   if (pcapHandle == NULL) {
     printf("Couldn't open device %s: %s\n", interface, errBuf);
     return(EXIT_FAILURE);
   }
 
   char BPF[128] = "ip host ";
-  sprintf(BPF, "ip dst host %s || ip dst host %s", sourceIPAddr, destinationIPAddr);
+  sprintf(BPF, "(ip dst host %s && ip src host %s) || (ip dst host %s && ip src host %s)", sourceIPAddr, destinationIPAddr, destinationIPAddr, sourceIPAddr);
 
   struct bpf_program compiledBPF;
   if (pcap_compile(pcapHandle, &compiledBPF, BPF, 0, 0) == -1) {
@@ -80,6 +84,7 @@ int main(int argc, char *argv[]) {
 
 	pcap_loop(pcapHandle, 0, gotPacket, NULL);
 
+	libnet_destroy(lContext);
 	pcap_close(pcapHandle);
   exit(0);
 }
@@ -92,8 +97,8 @@ void gotPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pac
 
 	printf("==== Got a %d byte packet ====\n", header->len);
 
-	decodeEther(packet);
-	decodeIP(packet + AM_ETHER_HDR_LEN);
+	struct amEtherHdr *etherHdr = decodeEther(packet);
+	struct amIPHdr *ipHdr = decodeIP(packet + AM_ETHER_HDR_LEN);
 
 	tcpHdrLength = decodeTCP(packet + AM_ETHER_HDR_LEN + sizeof(struct amIPHdr));
 	totalHdrSize = AM_ETHER_HDR_LEN + sizeof(struct amIPHdr) + tcpHdrLength;
@@ -106,6 +111,89 @@ void gotPacket(u_char *args, const struct pcap_pkthdr *header, const u_char *pac
 	} else {
 		printf("\t\t\tNo Packet Data");
 	}
+
+	uint8_t *pDestMac = NULL;
+	char convertedAddress[128];
+	struct in_addr address;
+
+	address.s_addr = ipHdr->ipSrcAddr;
+	sprintf(convertedAddress, "%s", inet_ntoa(address));
+	if (strcmp(convertedAddress, sourceIPAddr) == 0) {
+		pDestMac = getMac(destinationMac);
+		printf("\n{Packet prepared for MAC: %s}", destinationMac);
+	} else {
+		address.s_addr = ipHdr->ipDstAddr;
+		sprintf(convertedAddress, "%s", inet_ntoa(address));
+		if (strcmp(convertedAddress, destinationIPAddr) == 0) {
+			pDestMac = getMac(sourceMac);
+			printf("\n{Packet prepared for MAC: %s}", sourceMac);
+		}
+	}
+
+	int bytes = libnet_build_ethernet(
+																		pDestMac
+																		, libnet_get_hwaddr(lContext)->ether_addr_octet
+																		, ETHERTYPE_IP
+																		, pktDataLength ? pktData : NULL
+																		, pktDataLength
+																		, lContext
+																		, 0
+																	);
+	if (bytes == -1) {
+		printf("Can't build ethernet\n%s\n", libnet_geterror(lContext));
+	}
+	bytes = libnet_write(lContext);
+	if (bytes == -1) {
+		printf("Can't write\n%s\n", libnet_geterror(lContext));
+	} else {
+		printf("\n==== Packet Resended %db ====>>>\n", bytes);
+	}
+	libnet_clear_packet(lContext);
+}
+
+void initGlobals(char *argv[]) {
+	if (strncmp(argv[1], INTERFACE_KEY, 2) == 0) {
+	  strncpy(interface, argv[2], kMaxInterfaceLen);
+	} else {
+		goto ERROR_INIT_LABEL;
+	}
+
+	if (strncmp(argv[3], SOURCE_IP_KEY, 4) == 0) {
+	  strncpy(sourceIPAddr, argv[4], kMaxIPLen);
+	} else {
+		goto ERROR_INIT_LABEL;
+	}
+
+	if (strncmp(argv[5], SOURCE_MAC_KEY, 3) == 0) {
+	  strncpy(sourceMac, argv[6], kMaxMacLen);
+	} else {
+		goto ERROR_INIT_LABEL;
+	}
+
+	if (strncmp(argv[7], DESTINATION_IP_KEY, 4) == 0) {
+		strncpy(destinationIPAddr, argv[8], kMaxIPLen);
+	} else {
+		goto ERROR_INIT_LABEL;
+	}
+
+	if (strncmp(argv[9], DESTINATION_MAC_KEY, 3) == 0) {
+		strncpy(destinationMac, argv[10], kMaxMacLen);
+	} else {
+		goto ERROR_INIT_LABEL;
+	}
+
+	char errBuf[LIBNET_ERRBUF_SIZE];
+	lContext = libnet_init(LIBNET_LINK, interface, errBuf);
+	if (lContext == NULL) {
+		printf("Can't init libnet context\n%s\n", errBuf);
+		goto ERROR_INIT_LABEL;
+	}
+
+	return;
+
+ERROR_INIT_LABEL:
+	showTips(argv[0]);
+	exit(EXIT_FAILURE);
 }
 
 void dump(const u_char *dataBuffer, const u_int length) {
@@ -137,10 +225,10 @@ void dump(const u_char *dataBuffer, const u_int length) {
 	}
 }
 
-void decodeIP(const u_char *packet) {
-	const struct amIPHdr *ipHdr = NULL;
+struct amIPHdr* decodeIP(const u_char *packet) {
+	struct amIPHdr *ipHdr = NULL;
 
-	ipHdr = (const struct amIPHdr*)packet;
+	ipHdr = (struct amIPHdr*)packet;
 	printf("\t(( Layer 3 ::: IP Header ))\n");
 
 	struct in_addr address;
@@ -152,6 +240,8 @@ void decodeIP(const u_char *packet) {
 
 	printf("\t( Type: %u\t", (u_int)ipHdr->ipType);
 	printf("ID: %hu\tLength: %hu )\n", ntohs(ipHdr->ipID), ntohs(ipHdr->ipLength));
+
+	return ipHdr;
 }
 
 u_int decodeTCP(const u_char *packet) {
@@ -192,10 +282,10 @@ u_int decodeTCP(const u_char *packet) {
 	return hdrSize;
 }
 
-void decodeEther(const u_char *packet) {
-	const struct amEtherHdr *etherHdr = NULL;
+struct amEtherHdr* decodeEther(const u_char *packet) {
+	struct amEtherHdr *etherHdr = NULL;
 
-	etherHdr = (const struct amEtherHdr*)packet;
+	etherHdr = (struct amEtherHdr*)packet;
 	printf("[[ Layer 2 ::: Ethernet Header ]]\n");
 	printf("[ Source: %02x", etherHdr->etherSrcAddr[0]);
 	int index = 0;
@@ -209,44 +299,8 @@ void decodeEther(const u_char *packet) {
 	}
 
 	printf("\tType: %hu ]\n", etherHdr->etherType);
-}
 
-void initGlobals(char *argv[]) {
-	if (strncmp(argv[1], INTERFACE_KEY, 2) == 0) {
-	  strncpy(interface, argv[2], kMaxInterfaceLen);
-	} else {
-		goto ERROR_INIT_LABEL;
-	}
-
-	if (strncmp(argv[3], SOURCE_IP_KEY, 4) == 0) {
-	  strncpy(sourceIPAddr, argv[4], kMaxIPLen);
-	} else {
-		goto ERROR_INIT_LABEL;
-	}
-
-	if (strncmp(argv[5], SOURCE_MAC_KEY, 3) == 0) {
-	  strncpy(sourceMac, argv[6], kMaxMacLen);
-	} else {
-		goto ERROR_INIT_LABEL;
-	}
-
-	if (strncmp(argv[7], DESTINATION_IP_KEY, 4) == 0) {
-		strncpy(destinationIPAddr, argv[8], kMaxIPLen);
-	} else {
-		goto ERROR_INIT_LABEL;
-	}
-
-	if (strncmp(argv[9], DESTINATION_MAC_KEY, 3) == 0) {
-		strncpy(destinationMac, argv[10], kMaxMacLen);
-	} else {
-		goto ERROR_INIT_LABEL;
-	}
-
-	return;
-
-ERROR_INIT_LABEL:
-	showTips(argv[0]);
-	exit(EXIT_FAILURE);
+	return etherHdr;
 }
 
 const uint8_t* getMac(u_char *macStr) {
